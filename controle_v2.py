@@ -1,13 +1,13 @@
 """
 Bot de controle de gastos via Telegram — versão INTERATIVA com Google Sheets,
-com controle separado por usuário e um controle compartilhado da Família.
+com controle separado por usuário, controle compartilhado da Família e
+suporte a compras PARCELADAS.
 
 --------------------------------------------------------------------------
 COMO FUNCIONA (fluxo em árvore)
 --------------------------------------------------------------------------
-Cada comando abre uma sequência de perguntas com botões:
-
-    /gasto       -> [Pessoal | Família] -> [Categoria] -> digita o valor
+    /gasto       -> [Pessoal | Família] -> [Categoria] -> [À vista | Parcelado]
+                    -> (se parcelado) [nº de parcelas] -> valor
     /orcamento   -> [Pessoal | Família] -> [Todas | Categoria]
     /categorias  -> [Pessoal | Família]
     /extrato     -> [Pessoal | Família]
@@ -15,38 +15,44 @@ Cada comando abre uma sequência de perguntas com botões:
 Em qualquer passo dá para tocar em "❌ Cancelar" ou enviar /cancelar.
 Enviar outro comando no meio do fluxo reinicia a conversa.
 
-ATALHOS (o formato antigo continua funcionando)
-    /gasto [-F] <categoria> <valor>     ex: /gasto -F Farmácia 200
+ATALHOS (o formato em uma linha continua funcionando)
+    /gasto [-F] <categoria> <valor>            ex: /gasto -F Farmácia 200
+    /gasto [-F] <categoria> <valor> <N>x       ex: /gasto Lazer 600 3x
     /orcamento [-F] [categoria]
     /categorias -F
     /extrato -F
-Se o comando vier com -F, a pergunta "Pessoal ou Família?" é pulada.
+
+--------------------------------------------------------------------------
+COMPRAS PARCELADAS
+--------------------------------------------------------------------------
+O valor informado é o TOTAL da compra. O bot divide em N parcelas (os
+centavos que sobram vão para as primeiras parcelas) e já lança TODAS as
+parcelas na aba de gastos, uma por mês:
+
+    parcela 1 -> data da compra, parcela 2 -> +1 mês, parcela 3 -> +2 meses ...
+
+Como o orçamento soma apenas os lançamentos do mês atual, cada parcela só
+passa a pesar no orçamento do mês em que vence. O extrato mostra os últimos
+gastos já lançados e, em seguida, as próximas parcelas.
 
 --------------------------------------------------------------------------
 ESTRUTURA DA PLANILHA
 --------------------------------------------------------------------------
-Cada usuário tem o seu próprio par de abas, criado automaticamente na primeira
-vez em que ele usa o bot:
-
-    Orcamentos_<usuario>      Gastos_<usuario>
-
-E existe um par de abas compartilhado da família:
-
-    Orcamentos_Familia        Gastos_Familia
+Orcamentos_<usuario> / Gastos_<usuario>  e  Orcamentos_Familia / Gastos_Familia
 
 Aba de orçamentos:   A: Categoria | B: OrcamentoMensal
-Aba de gastos:       A: Data | B: Categoria | C: Valor | D: Usuario
+Aba de gastos:       A: Data | B: Categoria | C: Valor | D: Usuario | E: Parcela
 
+A coluna "Parcela" (ex: 2/5) é criada automaticamente nas abas existentes.
 Toda aba nova de orçamentos é semeada com DEFAULT_BUDGETS; depois disso os
 valores (e as categorias) são 100% editáveis direto na planilha.
 
 --------------------------------------------------------------------------
 MIGRAÇÃO DAS ABAS ANTIGAS
 --------------------------------------------------------------------------
-Se existirem as abas antigas "Orcamentos" e "Gastos" (versão de usuário único),
-elas são RENOMEADAS na inicialização para "Orcamentos_<LEGACY_OWNER>" e
-"Gastos_<LEGACY_OWNER>" — sem perder nenhum dado. O dono padrão é "rauhmones".
-Para desativar, defina LEGACY_OWNER= (vazio) no .env.
+Abas antigas "Orcamentos" e "Gastos" (usuário único) são RENOMEADAS na
+inicialização para "Orcamentos_<LEGACY_OWNER>" / "Gastos_<LEGACY_OWNER>".
+Padrão: "rauhmones". Para desativar, defina LEGACY_OWNER= (vazio) no .env.
 
 --------------------------------------------------------------------------
 CONFIGURAÇÃO (arquivo .env)
@@ -63,10 +69,11 @@ Instalação:  pip install -r requirements.txt
 Execução:    python bot_gastos.py
 """
 
+import calendar
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import gspread
@@ -119,7 +126,9 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 CABECALHO_ORCAMENTOS = ["Categoria", "OrcamentoMensal"]
-CABECALHO_GASTOS = ["Data", "Categoria", "Valor", "Usuario"]
+CABECALHO_GASTOS = ["Data", "Categoria", "Valor", "Usuario", "Parcela"]
+
+MAX_PARCELAS = 60
 
 # "Escopo" = de quem é o controle. Para usuários é o username/ID; para a
 # família é este valor fixo.
@@ -133,6 +142,76 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# CONVERSÕES (valores, datas, meses)
+# --------------------------------------------------------------------------
+def _parse_valor(bruto: str) -> Optional[float]:
+    """Interpreta '45,90', '1.200,50', '45.90' ou '1.200'. Retorna None se inválido."""
+    s = str(bruto).strip().replace("R$", "").replace(" ", "")
+    if not s:
+        return None
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
+        s = s.replace(".", "")  # "1.200" -> milhar
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _para_float(celula) -> float:
+    """Converte o conteúdo de uma célula em float, sem depender do locale.
+
+    Com UNFORMATTED_VALUE a API já devolve números como número; o ramo de
+    texto cobre células armazenadas como texto (ex: 'R$ 1.200,50')."""
+    if isinstance(celula, bool):
+        return 0.0
+    if isinstance(celula, (int, float)):
+        return float(celula)
+    valor = _parse_valor(str(celula)) if celula not in (None, "") else None
+    return valor if valor is not None else 0.0
+
+
+_FORMATOS_DATA = (DATE_FORMAT, "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y")
+
+
+def _parse_data(celula) -> Optional[datetime]:
+    """Aceita texto em formatos comuns ou número serial de data do Sheets."""
+    if isinstance(celula, bool) or celula in (None, ""):
+        return None
+    if isinstance(celula, (int, float)):
+        try:
+            data = datetime(1899, 12, 30) + timedelta(days=float(celula))
+        except (OverflowError, ValueError):
+            return None
+        # arredonda ao segundo mais próximo (o serial é um float)
+        return (data + timedelta(microseconds=500_000)).replace(microsecond=0)
+    texto = str(celula).strip()
+    for formato in _FORMATOS_DATA:
+        try:
+            return datetime.strptime(texto, formato)
+        except ValueError:
+            continue
+    return None
+
+
+def _somar_meses(data: datetime, meses: int) -> datetime:
+    """Soma meses mantendo o dia (ou o último dia do mês, se não existir)."""
+    indice = data.month - 1 + meses
+    ano = data.year + indice // 12
+    mes = indice % 12 + 1
+    dia = min(data.day, calendar.monthrange(ano, mes)[1])
+    return data.replace(year=ano, month=mes, day=dia)
+
+
+def _dividir_parcelas(valor_total: float, n: int) -> List[float]:
+    """Divide em n parcelas em centavos; as primeiras levam o centavo extra."""
+    total_centavos = round(valor_total * 100)
+    base, resto = divmod(total_centavos, n)
+    return [(base + (1 if i < resto else 0)) / 100 for i in range(n)]
 
 
 def normalizar_escopo(chave: str) -> str:
@@ -153,8 +232,17 @@ def nome_aba_gastos(escopo: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# CAMADA DE ACESSO AO GOOGLE SHEETS (inalterada)
+# CAMADA DE ACESSO AO GOOGLE SHEETS
 # --------------------------------------------------------------------------
+class Lancamento(NamedTuple):
+    data: Optional[datetime]
+    data_txt: str
+    categoria: str
+    valor: float
+    usuario: str
+    parcela: str
+
+
 class PlanilhaGastos:
     """Encapsula toda a leitura/escrita na planilha do Google.
 
@@ -202,6 +290,9 @@ class PlanilhaGastos:
             missing = [h for h in cabecalho if h not in existente]
             if missing:
                 logger.info("Atualizando cabeçalho da aba '%s', adicionando colunas: %s", nome, missing)
+                necessario = len(existente) + len(missing)
+                if aba.col_count < necessario:
+                    aba.add_cols(necessario - aba.col_count)
                 current_len = len(existente)
                 for i, col in enumerate(missing, start=1):
                     aba.update_cell(1, current_len + i, col)
@@ -232,19 +323,38 @@ class PlanilhaGastos:
             linhas = [[cat, valor] for cat, valor in DEFAULT_BUDGETS.items()]
             aba_orcamentos.append_rows(linhas)
 
+    @staticmethod
+    def _registros(aba) -> List[Dict[str, object]]:
+        """Lê a aba como lista de dicts, com valores BRUTOS (sem locale).
+
+        Substitui get_all_records(): ele aplica a "numericização" do gspread
+        sobre o texto formatado pela planilha (ex: '45,90'), e a vírgula
+        decimal brasileira era tratada como separador de milhar — daí o valor
+        100x maior. Com UNFORMATTED_VALUE os números chegam como número e as
+        datas, se forem células de data, como número serial."""
+        valores = aba.get_all_values(value_render_option="UNFORMATTED_VALUE")
+        if not valores:
+            return []
+        cabecalho = [str(c).strip() for c in valores[0]]
+        registros = []
+        for linha in valores[1:]:
+            if not any(str(c).strip() for c in linha):
+                continue
+            registros.append({
+                nome: (linha[i] if i < len(linha) else "")
+                for i, nome in enumerate(cabecalho) if nome
+            })
+        return registros
+
     # ---------------------- ORÇAMENTOS ----------------------
     def ler_orcamentos(self, escopo: str) -> Dict[str, float]:
         aba_orcamentos, _ = self.garantir_escopo(escopo)
-        registros = aba_orcamentos.get_all_records()
         orcamentos = {}
-        for linha in registros:
+        for linha in self._registros(aba_orcamentos):
             categoria = str(linha.get("Categoria", "")).strip()
             if not categoria:
                 continue
-            try:
-                orcamentos[categoria] = float(linha.get("OrcamentoMensal", 0) or 0)
-            except (TypeError, ValueError):
-                orcamentos[categoria] = 0.0
+            orcamentos[categoria] = _para_float(linha.get("OrcamentoMensal", 0))
         return orcamentos
 
     @staticmethod
@@ -261,50 +371,66 @@ class PlanilhaGastos:
     ) -> None:
         _, aba_gastos = self.garantir_escopo(escopo)
         agora = datetime.now().strftime(DATE_FORMAT)
-        aba_gastos.append_row([agora, categoria, valor, usuario or ""])
+        aba_gastos.append_row([agora, categoria, valor, usuario or "", ""])
+
+    def registrar_parcelado(
+        self, escopo: str, categoria: str, valor_total: float, n: int,
+        usuario: Optional[str] = None,
+    ) -> List[Tuple[datetime, float]]:
+        """Lança as n parcelas de uma vez (uma chamada à API), uma por mês."""
+        _, aba_gastos = self.garantir_escopo(escopo)
+        agora = datetime.now().replace(microsecond=0)
+        valores = _dividir_parcelas(valor_total, n)
+        parcelas = [(_somar_meses(agora, i), v) for i, v in enumerate(valores)]
+        linhas = [
+            [data.strftime(DATE_FORMAT), categoria, valor, usuario or "",
+             # apóstrofo força texto: sem ele o Sheets leria "1/5" como data
+             f"'{i}/{n}"]
+            for i, (data, valor) in enumerate(parcelas, start=1)
+        ]
+        aba_gastos.append_rows(linhas)
+        return parcelas
 
     def gastos_do_mes(self, escopo: str) -> Dict[str, float]:
         """Total gasto no mês atual, por categoria (chave em minúsculas).
 
-        Faz UMA leitura da aba, em vez de uma por categoria — importante para
-        não estourar a cota da API do Google Sheets com vários usuários."""
+        Faz UMA leitura da aba, em vez de uma por categoria. Parcelas futuras
+        têm data de meses futuros, então só entram no mês em que vencem."""
         _, aba_gastos = self.garantir_escopo(escopo)
         agora = datetime.now()
         totais: Dict[str, float] = {}
-        for linha in aba_gastos.get_all_records():
-            data_str = str(linha.get("Data", ""))
-            try:
-                data_lancamento = datetime.strptime(data_str, DATE_FORMAT)
-            except ValueError:
-                continue
-            if data_lancamento.month != agora.month or data_lancamento.year != agora.year:
-                continue
-            try:
-                valor = float(linha.get("Valor", 0) or 0)
-            except (TypeError, ValueError):
+        for linha in self._registros(aba_gastos):
+            data = _parse_data(linha.get("Data", ""))
+            if data is None or data.month != agora.month or data.year != agora.year:
                 continue
             chave = str(linha.get("Categoria", "")).strip().lower()
-            totais[chave] = totais.get(chave, 0.0) + valor
+            totais[chave] = totais.get(chave, 0.0) + _para_float(linha.get("Valor", 0))
         return totais
 
     def gasto_do_mes_por_categoria(self, escopo: str, categoria: str) -> float:
         return self.gastos_do_mes(escopo).get(categoria.strip().lower(), 0.0)
 
-    def ultimos_lancamentos(self, escopo: str, limite: int = 15) -> List[Tuple[str, str, float, str]]:
+    def extrato(self, escopo: str, limite: int = 15) -> Tuple[List[Lancamento], List[Lancamento]]:
+        """Retorna (últimos lançamentos já vencidos, parcelas futuras em ordem de data)."""
         _, aba_gastos = self.garantir_escopo(escopo)
-        registros = aba_gastos.get_all_records()
-        recentes = registros[-limite:]
-        resultado = []
-        for linha in recentes:
-            try:
-                valor = float(linha.get("Valor", 0) or 0)
-            except (TypeError, ValueError):
-                valor = 0.0
-            usuario = str(linha.get("Usuario", ""))
-            resultado.append(
-                (str(linha.get("Data", "")), str(linha.get("Categoria", "")), valor, usuario)
+        agora = datetime.now()
+        passados: List[Lancamento] = []
+        futuros: List[Lancamento] = []
+        for linha in self._registros(aba_gastos):
+            bruto = linha.get("Data", "")
+            data = _parse_data(bruto)
+            item = Lancamento(
+                data=data,
+                data_txt=data.strftime(DATE_FORMAT) if data else str(bruto),
+                categoria=str(linha.get("Categoria", "")),
+                valor=_para_float(linha.get("Valor", 0)),
+                usuario=str(linha.get("Usuario", "")),
+                parcela=str(linha.get("Parcela", "")).strip(),
             )
-        return resultado
+            (futuros if data and data > agora else passados).append(item)
+        passados.sort(key=lambda it: it.data or datetime.min)  # estável
+        futuros.sort(key=lambda it: it.data)
+        return passados[-limite:], futuros
 
 
 # Instância única, criada na inicialização do processo.
@@ -323,21 +449,6 @@ def _identificador_usuario(user) -> str:
     if user and user.username:
         return user.username.strip()
     return str(user.id)
-
-
-def _parse_valor(bruto: str) -> Optional[float]:
-    """Interpreta '45,90', '1.200,50', '45.90' ou '1.200'. Retorna None se inválido."""
-    s = bruto.strip().replace("R$", "").replace(" ", "")
-    if not s:
-        return None
-    if "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
-        s = s.replace(".", "")  # "1.200" -> milhar
-    try:
-        return float(s)
-    except ValueError:
-        return None
 
 
 class Contexto(NamedTuple):
@@ -416,6 +527,24 @@ def _teclado_categorias(categorias: List[str], com_todas: bool = False) -> Inlin
     return InlineKeyboardMarkup(linhas)
 
 
+def _teclado_pagamento() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💵 À vista", callback_data="pg:nao"),
+            InlineKeyboardButton("💳 Parcelado", callback_data="pg:sim"),
+        ],
+        [BOTAO_CANCELAR],
+    ])
+
+
+def _teclado_parcelas() -> InlineKeyboardMarkup:
+    opcoes = [2, 3, 4, 5, 6, 10, 12]
+    botoes = [InlineKeyboardButton(f"{n}x", callback_data=f"np:{n}") for n in opcoes]
+    linhas = [botoes[i:i + 4] for i in range(0, len(botoes), 4)]
+    linhas.append([BOTAO_CANCELAR])
+    return InlineKeyboardMarkup(linhas)
+
+
 def _teclado_cancelar() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[BOTAO_CANCELAR]])
 
@@ -424,15 +553,38 @@ def _teclado_cancelar() -> InlineKeyboardMarkup:
 # AÇÕES (lógica de cada comando, independente de como o usuário chegou nela)
 # --------------------------------------------------------------------------
 async def _acao_registrar_gasto(update: Update, ctx: Contexto, categoria: str, valor: float,
-                                orcamentos: Dict[str, float]) -> None:
-    planilha.registrar_gasto(ctx.escopo, categoria, valor, ctx.usuario)
+                                orcamentos: Dict[str, float], parcelas: int = 1) -> None:
+    if parcelas <= 1:
+        planilha.registrar_gasto(ctx.escopo, categoria, valor, ctx.usuario)
+        gasto_mes = planilha.gasto_do_mes_por_categoria(ctx.escopo, categoria)
+        restante = orcamentos[categoria] - gasto_mes
+        status = "✅" if restante >= 0 else "⚠️"
+        await _enviar(
+            update,
+            f"{status} [{ctx.titulo}] Gasto registrado: {categoria} — {_formatar_reais(valor)}\n"
+            f"Orçamento restante em {categoria}: {_formatar_reais(restante)} "
+            f"(de {_formatar_reais(orcamentos[categoria])})",
+        )
+        return
+
+    lancadas = planilha.registrar_parcelado(ctx.escopo, categoria, valor, parcelas, ctx.usuario)
+    valores = [v for _, v in lancadas]
+    if len(set(valores)) == 1:
+        detalhe = f"{parcelas}x de {_formatar_reais(valores[0])}"
+    else:
+        detalhe = f"{parcelas}x de ~{_formatar_reais(valores[0])} (centavos ajustados)"
+    primeira, ultima = lancadas[0][0], lancadas[-1][0]
+
     gasto_mes = planilha.gasto_do_mes_por_categoria(ctx.escopo, categoria)
     restante = orcamentos[categoria] - gasto_mes
     status = "✅" if restante >= 0 else "⚠️"
     await _enviar(
         update,
-        f"{status} [{ctx.titulo}] Gasto registrado: {categoria} — {_formatar_reais(valor)}\n"
-        f"Orçamento restante em {categoria}: {_formatar_reais(restante)} "
+        f"{status} [{ctx.titulo}] Compra parcelada registrada: {categoria}\n"
+        f"Total {_formatar_reais(valor)} — {detalhe}\n"
+        f"Parcelas lançadas de {primeira:%m/%Y} a {ultima:%m/%Y}.\n\n"
+        f"Orçamento restante em {categoria} neste mês "
+        f"(já com a 1ª parcela): {_formatar_reais(restante)} "
         f"(de {_formatar_reais(orcamentos[categoria])})",
     )
 
@@ -478,22 +630,41 @@ async def _acao_categorias(update: Update, ctx: Contexto) -> None:
     await _enviar(update, "\n".join(linhas))
 
 
+def _linha_extrato(data_txt: str, it: Lancamento) -> str:
+    parcela_txt = f" ({it.parcela})" if it.parcela else ""
+    usuario_txt = f" — {it.usuario}" if it.usuario else ""
+    return f"• {data_txt} — {it.categoria}: {_formatar_reais(it.valor)}{parcela_txt}{usuario_txt}"
+
+
 async def _acao_extrato(update: Update, ctx: Contexto) -> None:
-    lancamentos = planilha.ultimos_lancamentos(ctx.escopo, limite=15)
-    if not lancamentos:
+    passados, futuros = planilha.extrato(ctx.escopo, limite=15)
+    if not passados and not futuros:
         await _enviar(update, f"[{ctx.titulo}] Nenhum gasto registrado ainda.")
         return
-    linhas = [f"🧾 [{ctx.titulo}] Últimos gastos registrados:"]
-    for data_str, cat, valor, usuario in reversed(lancamentos):
-        usuario_txt = f" — {usuario}" if usuario else ""
-        linhas.append(f"• {data_str} — {cat}: {_formatar_reais(valor)}{usuario_txt}")
+
+    linhas = []
+    if passados:
+        linhas.append(f"🧾 [{ctx.titulo}] Últimos gastos registrados:")
+        for it in reversed(passados):
+            linhas.append(_linha_extrato(it.data_txt, it))
+    else:
+        linhas.append(f"🧾 [{ctx.titulo}] Nenhum gasto vencido ainda.")
+
+    if futuros:
+        mostrar = 10
+        linhas.append("")
+        linhas.append("📅 Próximas parcelas já lançadas:")
+        for it in futuros[:mostrar]:
+            linhas.append(_linha_extrato(it.data.strftime("%Y-%m-%d"), it))
+        if len(futuros) > mostrar:
+            linhas.append(f"… e mais {len(futuros) - mostrar} parcela(s).")
     await _enviar(update, "\n".join(linhas))
 
 
 # --------------------------------------------------------------------------
 # FLUXO INTERATIVO (ConversationHandler)
 # --------------------------------------------------------------------------
-ESCOPO, CATEGORIA, VALOR = range(3)
+ESCOPO, CATEGORIA, PARCELADO, PARCELAS, VALOR = range(5)
 
 ACAO_GASTO = "gasto"
 ACAO_ORCAMENTO = "orcamento"
@@ -507,6 +678,8 @@ _TITULO_ACAO = {
     ACAO_EXTRATO: "🧾 Extrato",
 }
 
+_RE_PARCELAS = re.compile(r"^(\d+)[xX]$")
+
 
 def _ctx_salvo(context: ContextTypes.DEFAULT_TYPE) -> Contexto:
     d = context.user_data
@@ -515,9 +688,13 @@ def _ctx_salvo(context: ContextTypes.DEFAULT_TYPE) -> Contexto:
 
 async def _atalho(update: Update, acao: str, ctx: Contexto) -> bool:
     """Executa o comando direto se ele já veio completo. Retorna True se executou."""
-    args = ctx.args
+    args = list(ctx.args)
 
     if acao == ACAO_GASTO and len(args) >= 2:
+        parcelas = 1
+        if len(args) >= 3 and _RE_PARCELAS.match(args[-1]):
+            parcelas = int(args[-1][:-1])
+            args = args[:-1]
         valor_bruto = args[-1]
         categoria_digitada = " ".join(args[:-1])
         valor = _parse_valor(valor_bruto)
@@ -527,6 +704,8 @@ async def _atalho(update: Update, acao: str, ctx: Contexto) -> bool:
             )
         elif valor <= 0:
             await update.message.reply_text("❌ O valor precisa ser positivo.")
+        elif not 1 <= parcelas <= MAX_PARCELAS:
+            await update.message.reply_text(f"❌ O número de parcelas deve ficar entre 1 e {MAX_PARCELAS}.")
         else:
             orcamentos = planilha.ler_orcamentos(ctx.escopo)
             categoria = planilha.encontrar_categoria(categoria_digitada, orcamentos)
@@ -536,7 +715,7 @@ async def _atalho(update: Update, acao: str, ctx: Contexto) -> bool:
                     f"Categorias disponíveis: {', '.join(orcamentos.keys())}"
                 )
             else:
-                await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos)
+                await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos, parcelas)
         return True
 
     if acao == ACAO_ORCAMENTO and len(args) >= 1:
@@ -642,16 +821,77 @@ async def escolher_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _acao_orcamento_categoria(update, ctx, categoria, orcamentos)
         return ConversationHandler.END
 
-    # acao == gasto: falta o valor
+    # acao == gasto: perguntar se é parcelado
     context.user_data["categoria"] = categoria
     await _enviar(
         update,
         f"{_TITULO_ACAO[ACAO_GASTO]} — {ctx.titulo}\n"
         f"Categoria: {categoria}\n\n"
-        f"Digite o valor (ex: 45,90):",
-        _teclado_cancelar(),
+        f"A compra foi à vista ou parcelada?",
+        _teclado_pagamento(),
     )
+    return PARCELADO
+
+
+async def _pedir_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx = _ctx_salvo(context)
+    categoria = context.user_data["categoria"]
+    n = context.user_data.get("parcelas", 1)
+    if n > 1:
+        texto = (
+            f"{_TITULO_ACAO[ACAO_GASTO]} — {ctx.titulo}\n"
+            f"Categoria: {categoria} • {n} parcelas\n\n"
+            f"Digite o VALOR TOTAL da compra (ex: 600,00).\n"
+            f"Vou dividir em {n} parcelas, uma por mês:"
+        )
+    else:
+        texto = (
+            f"{_TITULO_ACAO[ACAO_GASTO]} — {ctx.titulo}\n"
+            f"Categoria: {categoria} • à vista\n\n"
+            f"Digite o valor (ex: 45,90):"
+        )
+    await _enviar(update, texto, _teclado_cancelar())
     return VALOR
+
+
+async def escolher_parcelado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await verificar_permissao(update):
+        return ConversationHandler.END
+    ctx = _ctx_salvo(context)
+
+    if update.callback_query.data == "pg:nao":
+        context.user_data["parcelas"] = 1
+        return await _pedir_valor(update, context)
+
+    await _enviar(
+        update,
+        f"{_TITULO_ACAO[ACAO_GASTO]} — {ctx.titulo}\n"
+        f"Categoria: {context.user_data['categoria']} • parcelado\n\n"
+        f"Em quantas parcelas? Toque em uma opção ou digite o número (2 a {MAX_PARCELAS}):",
+        _teclado_parcelas(),
+    )
+    return PARCELAS
+
+
+async def escolher_parcelas_botao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await verificar_permissao(update):
+        return ConversationHandler.END
+    context.user_data["parcelas"] = int(update.callback_query.data.split(":", 1)[1])
+    return await _pedir_valor(update, context)
+
+
+async def receber_parcelas_texto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await verificar_permissao(update):
+        return ConversationHandler.END
+    texto = update.message.text.strip().lower().rstrip("x").strip()
+    if not texto.isdigit() or not 2 <= int(texto) <= MAX_PARCELAS:
+        await update.message.reply_text(
+            f"❌ Digite um número de parcelas entre 2 e {MAX_PARCELAS}:",
+            reply_markup=_teclado_parcelas(),
+        )
+        return PARCELAS
+    context.user_data["parcelas"] = int(texto)
+    return await _pedir_valor(update, context)
 
 
 async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -674,12 +914,13 @@ async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     ctx = _ctx_salvo(context)
     categoria = context.user_data["categoria"]
+    parcelas = context.user_data.get("parcelas", 1)
     orcamentos = planilha.ler_orcamentos(ctx.escopo)
     if categoria not in orcamentos:  # categoria removida da planilha no meio do fluxo
         await update.message.reply_text("⚠️ Essa categoria não existe mais. Envie /gasto novamente.")
         return ConversationHandler.END
 
-    await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos)
+    await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos, parcelas)
     return ConversationHandler.END
 
 
@@ -696,12 +937,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Olá! Eu sou seu bot de controle de gastos (dados salvos no Google Sheets).\n\n"
         "Comandos disponíveis — cada um vai te guiando com botões:\n"
-        "• /gasto — registra um gasto\n"
+        "• /gasto — registra um gasto (à vista ou parcelado)\n"
         "• /orcamento — saldo restante do mês (todas as categorias ou uma)\n"
         "• /categorias — categorias e orçamentos mensais\n"
-        "• /extrato — últimos gastos registrados\n"
+        "• /extrato — últimos gastos e próximas parcelas\n"
         "• /cancelar — cancela a operação em andamento\n\n"
-        "Atalho: /gasto -F Farmácia 200 registra direto no controle da Família."
+        "Atalhos: /gasto -F Farmácia 200  •  /gasto Lazer 600 3x"
     )
 
 
@@ -721,7 +962,7 @@ async def _registrar_menu(app: Application) -> None:
         BotCommand("gasto", "Registrar um gasto"),
         BotCommand("orcamento", "Ver saldo do orçamento"),
         BotCommand("categorias", "Listar categorias"),
-        BotCommand("extrato", "Últimos gastos"),
+        BotCommand("extrato", "Últimos gastos e parcelas"),
         BotCommand("cancelar", "Cancelar operação atual"),
     ])
 
@@ -748,6 +989,15 @@ def main() -> None:
             ],
             CATEGORIA: [
                 CallbackQueryHandler(escolher_categoria, pattern=r"^cat:(\d+|todas)$"),
+                cb_cancelar,
+            ],
+            PARCELADO: [
+                CallbackQueryHandler(escolher_parcelado, pattern=r"^pg:(sim|nao)$"),
+                cb_cancelar,
+            ],
+            PARCELAS: [
+                CallbackQueryHandler(escolher_parcelas_botao, pattern=r"^np:\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receber_parcelas_texto),
                 cb_cancelar,
             ],
             VALOR: [
