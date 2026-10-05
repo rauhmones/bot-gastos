@@ -20,7 +20,7 @@ ATALHOS (o formato em uma linha continua funcionando)
     /gasto [-F] <categoria> <valor> <N>x       ex: /gasto Lazer 600 3x
     /orcamento [-F] [categoria]
     /categorias -F
-    /extrato -F
+    /extrato [-F] [categoria|todos|extraordinarios]
 
 --------------------------------------------------------------------------
 COMPRAS PARCELADAS
@@ -126,7 +126,7 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 CABECALHO_ORCAMENTOS = ["Categoria", "OrcamentoMensal"]
-CABECALHO_GASTOS = ["Data", "Categoria", "Valor", "Usuario", "Parcela"]
+CABECALHO_GASTOS = ["Data", "Categoria", "Valor", "Usuario", "Parcela", "Extraordinario"]
 
 MAX_PARCELAS = 60
 
@@ -164,7 +164,7 @@ def _parse_valor(bruto: str) -> Optional[float]:
 
 def _para_float(celula) -> float:
     """Converte o conteúdo de uma célula em float, sem depender do locale.
-
+ 
     Com UNFORMATTED_VALUE a API já devolve números como número; o ramo de
     texto cobre células armazenadas como texto (ex: 'R$ 1.200,50')."""
     if isinstance(celula, bool):
@@ -173,6 +173,18 @@ def _para_float(celula) -> float:
         return float(celula)
     valor = _parse_valor(str(celula)) if celula not in (None, "") else None
     return valor if valor is not None else 0.0
+
+
+def _eh_extraordinario(celula) -> bool:
+    """Interpreta células booleanas/texto usada na coluna de gastos extraordinários."""
+    if isinstance(celula, bool):
+        return celula
+    if isinstance(celula, (int, float)):
+        return bool(celula)
+    texto = str(celula).strip().lower()
+    if not texto:
+        return False
+    return texto in {"1", "true", "yes", "sim", "s", "extra", "extraordinario", "extraordinário"}
 
 
 _FORMATOS_DATA = (DATE_FORMAT, "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y")
@@ -241,6 +253,7 @@ class Lancamento(NamedTuple):
     valor: float
     usuario: str
     parcela: str
+    extraordinario: bool = False
 
 
 class PlanilhaGastos:
@@ -367,15 +380,16 @@ class PlanilhaGastos:
 
     # ---------------------- GASTOS ----------------------
     def registrar_gasto(
-        self, escopo: str, categoria: str, valor: float, usuario: Optional[str] = None
+        self, escopo: str, categoria: str, valor: float, usuario: Optional[str] = None,
+        extraordinario: bool = False,
     ) -> None:
         _, aba_gastos = self.garantir_escopo(escopo)
         agora = datetime.now().strftime(DATE_FORMAT)
-        aba_gastos.append_row([agora, categoria, valor, usuario or "", ""])
+        aba_gastos.append_row([agora, categoria, valor, usuario or "", "", "Sim" if extraordinario else ""])
 
     def registrar_parcelado(
         self, escopo: str, categoria: str, valor_total: float, n: int,
-        usuario: Optional[str] = None,
+        usuario: Optional[str] = None, extraordinario: bool = False,
     ) -> List[Tuple[datetime, float]]:
         """Lança as n parcelas de uma vez (uma chamada à API), uma por mês."""
         _, aba_gastos = self.garantir_escopo(escopo)
@@ -385,24 +399,26 @@ class PlanilhaGastos:
         linhas = [
             [data.strftime(DATE_FORMAT), categoria, valor, usuario or "",
              # apóstrofo força texto: sem ele o Sheets leria "1/5" como data
-             f"'{i}/{n}"]
+             f"'{i}/{n}", "Sim" if extraordinario else ""]
             for i, (data, valor) in enumerate(parcelas, start=1)
         ]
         aba_gastos.append_rows(linhas)
         return parcelas
 
-    def gastos_do_mes(self, escopo: str) -> Dict[str, float]:
+    def gastos_do_mes(self, escopo: str, incluir_extraordinarios: bool = False) -> Dict[str, float]:
         """Total gasto no mês atual, por categoria (chave em minúsculas).
-
+ 
         Faz UMA leitura da aba, em vez de uma por categoria. Parcelas futuras
         têm data de meses futuros, então só entram no mês em que vencem."""
         _, aba_gastos = self.garantir_escopo(escopo)
         agora = datetime.now()
         totais: Dict[str, float] = {}
         for linha in self._registros(aba_gastos):
+            if _eh_extraordinario(linha.get("Extraordinario", "")) and not incluir_extraordinarios:
+                continue
             data = _parse_data(linha.get("Data", ""))
             if data is None or data.month != agora.month or data.year != agora.year:
-                continue
+               continue
             chave = str(linha.get("Categoria", "")).strip().lower()
             totais[chave] = totais.get(chave, 0.0) + _para_float(linha.get("Valor", 0))
         return totais
@@ -410,23 +426,38 @@ class PlanilhaGastos:
     def gasto_do_mes_por_categoria(self, escopo: str, categoria: str) -> float:
         return self.gastos_do_mes(escopo).get(categoria.strip().lower(), 0.0)
 
-    def extrato(self, escopo: str, limite: int = 15) -> Tuple[List[Lancamento], List[Lancamento]]:
-        """Retorna (últimos lançamentos já vencidos, parcelas futuras em ordem de data)."""
+    def extrato(
+        self,
+        escopo: str,
+        categoria: Optional[str] = None,
+        somente_extraordinarios: bool = False,
+        limite: int = 15,
+    ) -> Tuple[List[Lancamento], List[Lancamento]]:
+        """Retorna (últimos lançamentos já vencidos, parcelas futuras em ordem de data).
+
+        Se `categoria` for informada, filtra por ela; se `somente_extraordinarios`
+        for verdadeiro, mostra apenas gastos extraordinários."""
         _, aba_gastos = self.garantir_escopo(escopo)
         agora = datetime.now()
         passados: List[Lancamento] = []
         futuros: List[Lancamento] = []
+        categoria_normalizada = categoria.strip().lower() if categoria else None
         for linha in self._registros(aba_gastos):
             bruto = linha.get("Data", "")
             data = _parse_data(bruto)
             item = Lancamento(
-                data=data,
-                data_txt=data.strftime(DATE_FORMAT) if data else str(bruto),
-                categoria=str(linha.get("Categoria", "")),
-                valor=_para_float(linha.get("Valor", 0)),
-                usuario=str(linha.get("Usuario", "")),
-                parcela=str(linha.get("Parcela", "")).strip(),
+               data=data,
+               data_txt=data.strftime(DATE_FORMAT) if data else str(bruto),
+               categoria=str(linha.get("Categoria", "")).strip(),
+               valor=_para_float(linha.get("Valor", 0)),
+               usuario=str(linha.get("Usuario", "")),
+               parcela=str(linha.get("Parcela", "")).strip(),
+               extraordinario=_eh_extraordinario(linha.get("Extraordinario", "")),
             )
+            if categoria_normalizada and item.categoria.strip().lower() != categoria_normalizada:
+               continue
+            if somente_extraordinarios and not item.extraordinario:
+               continue
             (futuros if data and data > agora else passados).append(item)
         passados.sort(key=lambda it: it.data or datetime.min)  # estável
         futuros.sort(key=lambda it: it.data)
@@ -517,12 +548,18 @@ def _teclado_escopo() -> InlineKeyboardMarkup:
     ])
 
 
-def _teclado_categorias(categorias: List[str], com_todas: bool = False) -> InlineKeyboardMarkup:
+def _teclado_categorias(
+    categorias: List[str],
+    com_todas: bool = False,
+    com_extraordinarios: bool = False,
+) -> InlineKeyboardMarkup:
     # callback_data tem limite de 64 bytes; por isso usamos o índice da categoria.
     botoes = [InlineKeyboardButton(cat, callback_data=f"cat:{i}") for i, cat in enumerate(categorias)]
     linhas = [botoes[i:i + 2] for i in range(0, len(botoes), 2)]
     if com_todas:
         linhas.insert(0, [InlineKeyboardButton("📊 Todas as categorias", callback_data="cat:todas")])
+    if com_extraordinarios:
+        linhas.insert(1 if com_todas else 0, [InlineKeyboardButton("✨ Gastos extraordinários", callback_data="cat:extraordinarios")])
     linhas.append([BOTAO_CANCELAR])
     return InlineKeyboardMarkup(linhas)
 
@@ -532,6 +569,16 @@ def _teclado_pagamento() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("💵 À vista", callback_data="pg:nao"),
             InlineKeyboardButton("💳 Parcelado", callback_data="pg:sim"),
+        ],
+        [BOTAO_CANCELAR],
+    ])
+
+
+def _teclado_extraordinario() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Conta no orçamento", callback_data="ex:nao"),
+            InlineKeyboardButton("✨ Extraordinário", callback_data="ex:sim"),
         ],
         [BOTAO_CANCELAR],
     ])
@@ -553,21 +600,30 @@ def _teclado_cancelar() -> InlineKeyboardMarkup:
 # AÇÕES (lógica de cada comando, independente de como o usuário chegou nela)
 # --------------------------------------------------------------------------
 async def _acao_registrar_gasto(update: Update, ctx: Contexto, categoria: str, valor: float,
-                                orcamentos: Dict[str, float], parcelas: int = 1) -> None:
+                                orcamentos: Dict[str, float], parcelas: int = 1,
+                                extraordinario: bool = False) -> None:
     if parcelas <= 1:
-        planilha.registrar_gasto(ctx.escopo, categoria, valor, ctx.usuario)
+        planilha.registrar_gasto(ctx.escopo, categoria, valor, ctx.usuario, extraordinario=extraordinario)
         gasto_mes = planilha.gasto_do_mes_por_categoria(ctx.escopo, categoria)
         restante = orcamentos[categoria] - gasto_mes
         status = "✅" if restante >= 0 else "⚠️"
+        tipo_txt = " (gasto extraordinário)" if extraordinario else ""
         await _enviar(
             update,
-            f"{status} [{ctx.titulo}] Gasto registrado: {categoria} — {_formatar_reais(valor)}\n"
+            f"{status} [{ctx.titulo}] Gasto registrado: {categoria}{tipo_txt} — {_formatar_reais(valor)}\n"
             f"Orçamento restante em {categoria}: {_formatar_reais(restante)} "
             f"(de {_formatar_reais(orcamentos[categoria])})",
         )
         return
 
-    lancadas = planilha.registrar_parcelado(ctx.escopo, categoria, valor, parcelas, ctx.usuario)
+    lancadas = planilha.registrar_parcelado(
+        ctx.escopo,
+        categoria,
+        valor,
+        parcelas,
+        ctx.usuario,
+        extraordinario=extraordinario,
+    )
     valores = [v for _, v in lancadas]
     if len(set(valores)) == 1:
         detalhe = f"{parcelas}x de {_formatar_reais(valores[0])}"
@@ -578,9 +634,10 @@ async def _acao_registrar_gasto(update: Update, ctx: Contexto, categoria: str, v
     gasto_mes = planilha.gasto_do_mes_por_categoria(ctx.escopo, categoria)
     restante = orcamentos[categoria] - gasto_mes
     status = "✅" if restante >= 0 else "⚠️"
+    tipo_txt = " (gasto extraordinário)" if extraordinario else ""
     await _enviar(
         update,
-        f"{status} [{ctx.titulo}] Compra parcelada registrada: {categoria}\n"
+        f"{status} [{ctx.titulo}] Compra parcelada registrada: {categoria}{tipo_txt}\n"
         f"Total {_formatar_reais(valor)} — {detalhe}\n"
         f"Parcelas lançadas de {primeira:%m/%Y} a {ultima:%m/%Y}.\n\n"
         f"Orçamento restante em {categoria} neste mês "
@@ -633,22 +690,48 @@ async def _acao_categorias(update: Update, ctx: Contexto) -> None:
 def _linha_extrato(data_txt: str, it: Lancamento) -> str:
     parcela_txt = f" ({it.parcela})" if it.parcela else ""
     usuario_txt = f" — {it.usuario}" if it.usuario else ""
-    return f"• {data_txt} — {it.categoria}: {_formatar_reais(it.valor)}{parcela_txt}{usuario_txt}"
+    extra_txt = " ✨ extra" if it.extraordinario else ""
+    return f"• {data_txt} — {it.categoria}: {_formatar_reais(it.valor)}{parcela_txt}{extra_txt}{usuario_txt}"
 
 
-async def _acao_extrato(update: Update, ctx: Contexto) -> None:
-    passados, futuros = planilha.extrato(ctx.escopo, limite=15)
+async def _acao_extrato(
+    update: Update,
+    ctx: Contexto,
+    categoria: Optional[str] = None,
+    somente_extraordinarios: bool = False,
+) -> None:
+    passados, futuros = planilha.extrato(
+        ctx.escopo,
+        categoria=categoria,
+        somente_extraordinarios=somente_extraordinarios,
+        limite=15,
+    )
     if not passados and not futuros:
-        await _enviar(update, f"[{ctx.titulo}] Nenhum gasto registrado ainda.")
+        if somente_extraordinarios:
+            await _enviar(update, f"[{ctx.titulo}] Nenhum gasto extraordinário registrado ainda.")
+        elif categoria:
+            await _enviar(update, f"[{ctx.titulo}] Nenhum gasto registrado na categoria '{categoria}' ainda.")
+        else:
+            await _enviar(update, f"[{ctx.titulo}] Nenhum gasto registrado ainda.")
         return
 
     linhas = []
-    if passados:
+    if somente_extraordinarios:
+        linhas.append(f"🧾 [{ctx.titulo}] Gastos extraordinários registrados:")
+    elif categoria:
+        linhas.append(f"🧾 [{ctx.titulo}] Extrato de {categoria}:")
+    else:
         linhas.append(f"🧾 [{ctx.titulo}] Últimos gastos registrados:")
+    if passados:
         for it in reversed(passados):
             linhas.append(_linha_extrato(it.data_txt, it))
     else:
-        linhas.append(f"🧾 [{ctx.titulo}] Nenhum gasto vencido ainda.")
+        if somente_extraordinarios:
+            linhas.append("Nenhum gasto extraordinário vencido ainda.")
+        elif categoria:
+            linhas.append("Nenhum gasto vencido nessa categoria ainda.")
+        else:
+            linhas.append("Nenhum gasto vencido ainda.")
 
     if futuros:
         mostrar = 10
@@ -664,7 +747,7 @@ async def _acao_extrato(update: Update, ctx: Contexto) -> None:
 # --------------------------------------------------------------------------
 # FLUXO INTERATIVO (ConversationHandler)
 # --------------------------------------------------------------------------
-ESCOPO, CATEGORIA, PARCELADO, PARCELAS, VALOR = range(5)
+ESCOPO, CATEGORIA, PARCELADO, PARCELAS, VALOR, EXTRAORDINARIO = range(6)
 
 ACAO_GASTO = "gasto"
 ACAO_ORCAMENTO = "orcamento"
@@ -691,6 +774,14 @@ async def _atalho(update: Update, acao: str, ctx: Contexto) -> bool:
     args = list(ctx.args)
 
     if acao == ACAO_GASTO and len(args) >= 2:
+        extraordinario = False
+        args_filtradas = []
+        for item in args:
+            if item.lower() in {"-e", "-x", "extra", "extraordinario", "extraordinários", "extraordinaria", "extraordinária"}:
+                extraordinario = True
+            else:
+                args_filtradas.append(item)
+        args = args_filtradas
         parcelas = 1
         if len(args) >= 3 and _RE_PARCELAS.match(args[-1]):
             parcelas = int(args[-1][:-1])
@@ -715,7 +806,7 @@ async def _atalho(update: Update, acao: str, ctx: Contexto) -> bool:
                     f"Categorias disponíveis: {', '.join(orcamentos.keys())}"
                 )
             else:
-                await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos, parcelas)
+                await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos, parcelas, extraordinario)
         return True
 
     if acao == ACAO_ORCAMENTO and len(args) >= 1:
@@ -729,6 +820,25 @@ async def _atalho(update: Update, acao: str, ctx: Contexto) -> bool:
             )
         else:
             await _acao_orcamento_categoria(update, ctx, categoria, orcamentos)
+        return True
+
+    if acao == ACAO_EXTRATO and len(args) >= 1:
+        termo = " ".join(args).strip().lower()
+        if termo in {"todos", "todas", "total", "geral"}:
+            await _acao_extrato(update, ctx)
+            return True
+        if termo in {"extra", "extraordinario", "extraordinarios", "extraordinária", "extraordinárias"}:
+            await _acao_extrato(update, ctx, somente_extraordinarios=True)
+            return True
+        orcamentos = planilha.ler_orcamentos(ctx.escopo)
+        categoria = planilha.encontrar_categoria(" ".join(args), orcamentos)
+        if categoria is None:
+            await update.message.reply_text(
+                f"❌ Categoria '{' '.join(args)}' não encontrada.\n"
+                f"Categorias disponíveis: {', '.join(orcamentos.keys())}"
+            )
+        else:
+            await _acao_extrato(update, ctx, categoria=categoria)
         return True
 
     # /categorias -F e /extrato -F já sabem tudo o que precisam.
@@ -748,8 +858,18 @@ async def _apos_escopo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await _acao_categorias(update, ctx)
         return ConversationHandler.END
     if acao == ACAO_EXTRATO:
-        await _acao_extrato(update, ctx)
-        return ConversationHandler.END
+        orcamentos = planilha.ler_orcamentos(ctx.escopo)
+        context.user_data["cats"] = list(orcamentos.keys())
+        await _enviar(
+            update,
+            f"{_TITULO_ACAO[acao]} — {ctx.titulo}\n\nQual faixa do extrato você quer ver?",
+            _teclado_categorias(
+                context.user_data["cats"],
+                com_todas=True,
+                com_extraordinarios=True,
+            ),
+        )
+        return CATEGORIA
 
     # gasto / orcamento: perguntar a categoria
     orcamentos = planilha.ler_orcamentos(ctx.escopo)
@@ -806,7 +926,17 @@ async def escolher_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE)
     escolha = update.callback_query.data.split(":", 1)[1]
 
     if escolha == "todas":
-        await _acao_orcamento_todas(update, ctx)
+        if acao == ACAO_EXTRATO:
+            await _acao_extrato(update, ctx)
+        else:
+            await _acao_orcamento_todas(update, ctx)
+        return ConversationHandler.END
+
+    if escolha == "extraordinarios":
+        if acao == ACAO_EXTRATO:
+            await _acao_extrato(update, ctx, somente_extraordinarios=True)
+            return ConversationHandler.END
+        await _enviar(update, "⚠️ Essa opção só vale para o extrato.")
         return ConversationHandler.END
 
     cats = context.user_data.get("cats", [])
@@ -821,6 +951,10 @@ async def escolher_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _acao_orcamento_categoria(update, ctx, categoria, orcamentos)
         return ConversationHandler.END
 
+    if acao == ACAO_EXTRATO:
+        await _acao_extrato(update, ctx, categoria=categoria)
+        return ConversationHandler.END
+
     # acao == gasto: perguntar se é parcelado
     context.user_data["categoria"] = categoria
     await _enviar(
@@ -831,6 +965,19 @@ async def escolher_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _teclado_pagamento(),
     )
     return PARCELADO
+
+
+async def _pedir_extraordinario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx = _ctx_salvo(context)
+    categoria = context.user_data["categoria"]
+    n = context.user_data.get("parcelas", 1)
+    texto = (
+        f"{_TITULO_ACAO[ACAO_GASTO]} — {ctx.titulo}\n"
+        f"Categoria: {categoria} • {'parcelado' if n > 1 else 'à vista'}\n\n"
+        f"Esse gasto entra no orçamento da categoria?"
+    )
+    await _enviar(update, texto, _teclado_extraordinario())
+    return EXTRAORDINARIO
 
 
 async def _pedir_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -861,7 +1008,7 @@ async def escolher_parcelado(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if update.callback_query.data == "pg:nao":
         context.user_data["parcelas"] = 1
-        return await _pedir_valor(update, context)
+        return await _pedir_extraordinario(update, context)
 
     await _enviar(
         update,
@@ -877,7 +1024,7 @@ async def escolher_parcelas_botao(update: Update, context: ContextTypes.DEFAULT_
     if not await verificar_permissao(update):
         return ConversationHandler.END
     context.user_data["parcelas"] = int(update.callback_query.data.split(":", 1)[1])
-    return await _pedir_valor(update, context)
+    return await _pedir_extraordinario(update, context)
 
 
 async def receber_parcelas_texto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -891,6 +1038,13 @@ async def receber_parcelas_texto(update: Update, context: ContextTypes.DEFAULT_T
         )
         return PARCELAS
     context.user_data["parcelas"] = int(texto)
+    return await _pedir_extraordinario(update, context)
+
+
+async def escolher_extraordinario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await verificar_permissao(update):
+        return ConversationHandler.END
+    context.user_data["extraordinario"] = update.callback_query.data == "ex:sim"
     return await _pedir_valor(update, context)
 
 
@@ -915,12 +1069,13 @@ async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     ctx = _ctx_salvo(context)
     categoria = context.user_data["categoria"]
     parcelas = context.user_data.get("parcelas", 1)
+    extraordinario = context.user_data.get("extraordinario", False)
     orcamentos = planilha.ler_orcamentos(ctx.escopo)
     if categoria not in orcamentos:  # categoria removida da planilha no meio do fluxo
         await update.message.reply_text("⚠️ Essa categoria não existe mais. Envie /gasto novamente.")
         return ConversationHandler.END
 
-    await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos, parcelas)
+    await _acao_registrar_gasto(update, ctx, categoria, valor, orcamentos, parcelas, extraordinario)
     return ConversationHandler.END
 
 
@@ -940,9 +1095,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /gasto — registra um gasto (à vista ou parcelado)\n"
         "• /orcamento — saldo restante do mês (todas as categorias ou uma)\n"
         "• /categorias — categorias e orçamentos mensais\n"
-        "• /extrato — últimos gastos e próximas parcelas\n"
+        "• /extrato — últimos gastos, por categoria/total ou extraordinários\n"
         "• /cancelar — cancela a operação em andamento\n\n"
-        "Atalhos: /gasto -F Farmácia 200  •  /gasto Lazer 600 3x"
+        "Atalhos: /gasto -F Farmácia 200  •  /gasto Lazer 600 3x  •  /extrato extraordinarios"
     )
 
 
@@ -988,7 +1143,7 @@ def main() -> None:
                 cb_cancelar,
             ],
             CATEGORIA: [
-                CallbackQueryHandler(escolher_categoria, pattern=r"^cat:(\d+|todas)$"),
+                CallbackQueryHandler(escolher_categoria, pattern=r"^cat:(\d+|todas|extraordinarios)$"),
                 cb_cancelar,
             ],
             PARCELADO: [
@@ -998,6 +1153,10 @@ def main() -> None:
             PARCELAS: [
                 CallbackQueryHandler(escolher_parcelas_botao, pattern=r"^np:\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receber_parcelas_texto),
+                cb_cancelar,
+            ],
+            EXTRAORDINARIO: [
+                CallbackQueryHandler(escolher_extraordinario, pattern=r"^ex:(sim|nao)$"),
                 cb_cancelar,
             ],
             VALOR: [
